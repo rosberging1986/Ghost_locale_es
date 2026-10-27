@@ -67,8 +67,6 @@ export function useSentry(): void {
   }, [role]);
 
   useEffect(() => {
-    if (routePattern) {
-      setTag('route', routePattern);
-    }
+    setTag('route', routePattern);
   }, [routePattern]);
 }

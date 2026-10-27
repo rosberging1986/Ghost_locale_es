@@ -36,6 +36,7 @@ import type { PostType } from '@/editor/card-config';
 import { createLocalRevisionWriter } from '@/editor/local-revisions';
 import {
   reportEditorError,
+  reportEditorNotice,
   reportLeaveConfirmation,
   reportSaveFailure,
 } from '@/editor/report-error';
@@ -52,9 +53,14 @@ import type { PublishDispatcher } from '@/editor/publish/publish-options';
 import type { EditorRecord } from './projection';
 import type { EditorSettingsFields, EditorSettingsPatch } from './settings-fields';
 import { EDITOR_REQUEST_OPTIONS } from '@/editor/request-options';
+import { syncSearchIndexes } from '@/shared/search-index';
 
-/** What a reload found: the server's copy, a post that is no longer there, or a read that failed. */
-export type ReloadOutcome = 'reloaded' | 'gone' | 'failed';
+/**
+ * What a reload found: the server's copy, a post that is no longer there, or a
+ * read that failed. `abandoned` means the writer left the editor before the read
+ * came back, so there was nothing left to replace.
+ */
+export type ReloadOutcome = 'reloaded' | 'gone' | 'failed' | 'abandoned';
 
 interface EditorReadResponse {
   posts?: EditorRecord[];
@@ -92,6 +98,8 @@ export interface EditorSessionHandle {
   contentText: () => string;
   /** Replaces the document with the server's copy, or says why it could not. */
   reload: () => Promise<ReloadOutcome>;
+  /** A later version was saved elsewhere, and a reload onto it would lose nothing. */
+  newerVersionAvailable: boolean;
   /** Puts a revision's content back into the editor and saves it; true once persisted. */
   restoreRevision: (restored: RestoredRevision) => Promise<boolean>;
   patchFeatureImage: EditorSession['patchFeatureImage'];
@@ -122,12 +130,26 @@ export interface EditorSessionHandle {
   getSaveSnapshot: EditorSession['getSaveSnapshot'];
   /** The body the writer is looking at, which a save has not necessarily seen yet. */
   getLiveLexical: EditorSession['getLiveLexical'];
-  /** Retries the save the error banner reports. */
+  /** Retries the failed save the status line reports. */
   retrySave: () => void;
+  /** The field an explicit save would be refused over, read from the save's own validator. */
+  invalidField: EditorSession['invalidField'];
   /** An explicit save whose completion the caller acts on, such as before a publish or preview. */
   saveExplicit: () => Promise<SaveCompletion>;
   /** Runs the publish flow's commands through the engine, the only writer. */
   dispatchPublish: PublishDispatcher;
+  /**
+   * Whether the sign-in dialog is open: a save found the session gone, or a read or
+   * request outside the engine asked for sign-in with `requestReauth()`.
+   */
+  reauthOpen: boolean;
+  /**
+   * Opens the sign-in dialog for a read or request outside the engine's saves that
+   * found the session gone. Resolves true once the writer has signed in again, so the
+   * caller can repeat it, and false when they abandon the dialog. Requests made while
+   * the dialog is open share it.
+   */
+  requestReauth: () => Promise<boolean>;
   reauthSucceeded: () => void;
   reauthAbandoned: () => void;
   /** Resolves once nothing is in flight; `proceed` means leaving loses nothing. */
@@ -155,7 +177,7 @@ function bootedDebounceMs(value: unknown): number | undefined {
 }
 
 /** The screen's read of the post: its URL, and the cache entry the loader and the session share. */
-function editorRead(postType: PostType, id: string) {
+export function editorRead(postType: PostType, id: string) {
   const path = postType === 'page' ? `/pages/${id}/` : `/posts/${id}/`;
   const url = apiUrl(path, buildPostEditorReadParams());
   return { url, queryKey: [postType === 'page' ? pagesDataType : postsDataType, url] as const };
@@ -206,9 +228,17 @@ export function useEditorSession({
   const [loadedRecord, setLoadedRecord] = useState(record);
   const [contentKey, setContentKey] = useState(0);
 
-  const transport = useRef({ addPost, editPost, addPage, editPage, generateSlug, postType });
+  const transport = useRef({
+    addPost,
+    editPost,
+    addPage,
+    editPage,
+    generateSlug,
+    fetchApi,
+    postType,
+  });
   useEffect(() => {
-    transport.current = { addPost, editPost, addPage, editPage, generateSlug, postType };
+    transport.current = { addPost, editPost, addPage, editPage, generateSlug, fetchApi, postType };
   });
 
   // `editorAutosaveDebounceMs` is test-only: the acceptance harness injects it through
@@ -217,6 +247,18 @@ export function useEditorSession({
   useEffect(() => {
     autosaveDebounceMs.current = bootedDebounceMs(configData?.config.editorAutosaveDebounceMs);
   });
+
+  // Post and page edits leave the search-index lists alone, so the record each
+  // write is answered with is written into them on its way to the session.
+  const listed = <Saved extends EditorRecord | undefined>(
+    key: 'posts' | 'pages',
+    saved: Saved,
+  ): Saved => {
+    if (saved) {
+      syncSearchIndexes(queryClient, key, saved);
+    }
+    return saved;
+  };
 
   // Construction must start no timer, request or outside subscription:
   // StrictMode may call this twice and discard the first session undisposed.
@@ -228,8 +270,8 @@ export function useEditorSession({
       saveFailureMessage: `Couldn’t save this ${postType}.`,
       autosaveDebounceMs: () => autosaveDebounceMs.current,
       onIdAcquired: setPersistedId,
-      // The loader opens the post again from this entry, possibly before the read
-      // that follows the save has landed; a later version a read put there stays.
+      // The loader opens the post again from this entry when the read that reopens
+      // it fails; a later version a read put there stays.
       onSaveAcknowledged: (saved) => {
         queryClient.setQueryData<EditorReadResponse>(
           editorRead(postType, saved.id).queryKey,
@@ -248,7 +290,11 @@ export function useEditorSession({
         type: postType,
         storage: () => window.localStorage,
         onError: reportEditorError,
+        onNotice: reportEditorNotice,
       }),
+      // Each write reaches the search-index lists as soon as it is answered, here
+      // rather than in the session's acknowledgement, which a session the writer
+      // has left by then never reaches.
       transport: {
         create: async (payload: EditorCreatePayload) => {
           const current = transport.current;
@@ -257,13 +303,13 @@ export function useEditorSession({
               page: { ...payload, status: pageStatus(payload.status) },
               sessionExpiryRedirect: false,
             });
-            return pages[0];
+            return listed('pages', pages[0]);
           }
           const { posts } = await current.addPost({
             post: payload,
             sessionExpiryRedirect: false,
           });
-          return posts[0];
+          return listed('posts', posts[0]);
         },
         update: async (payload: EditorEditPayload, options: PostWriteOptions) => {
           const current = transport.current;
@@ -273,14 +319,22 @@ export function useEditorSession({
               options,
               sessionExpiryRedirect: false,
             });
-            return pages[0];
+            return listed('pages', pages[0]);
           }
           const { posts } = await current.editPost({
             post: payload,
             options,
             sessionExpiryRedirect: false,
           });
-          return posts[0];
+          return listed('posts', posts[0]);
+        },
+        read: async (id) => {
+          const current = transport.current;
+          const data = await current.fetchApi<EditorReadResponse>(
+            editorRead(current.postType, id).url,
+            EDITOR_REQUEST_OPTIONS,
+          );
+          return recordIn(current.postType, data);
         },
         generateSlug: (text, postId) =>
           transport.current.generateSlug({
@@ -304,6 +358,7 @@ export function useEditorSession({
   }, [session]);
 
   // A closing or backgrounded tab never unmounts the editor, and a discarded one never fires `pagehide`.
+  // Unmounting flushes too: a reload can follow it before the deferred disposal runs.
   useEffect(() => {
     const flush = () => session.flushLocalRevision();
     const flushWhenHidden = () => {
@@ -316,6 +371,7 @@ export function useEditorSession({
     return () => {
       window.removeEventListener('pagehide', flush);
       document.removeEventListener('visibilitychange', flushWhenHidden);
+      flush();
     };
   }, [session]);
 
@@ -329,6 +385,7 @@ export function useEditorSession({
     publishTime,
     featureImageAlt,
     featureImageCaption,
+    newerVersionAvailable,
   } = view;
 
   // The view keeps its identity until one of the values it publishes
@@ -363,15 +420,19 @@ export function useEditorSession({
   );
 
   // The saved record: the same query key the screen loaded with, so an existing
-  // post shares one cache entry and a created one starts observing its own.
+  // post shares one cache entry and a created one starts observing its own. The
+  // loader has just read it, so mounting here starts no read of its own: after a
+  // failed opening read it would only repeat the request that failed.
   const postQuery = useEditorPost(persistedId ?? '', {
     enabled: postType === 'post' && !!persistedId,
     defaultErrorHandler: false,
+    refetchOnMount: false,
     requestOptions: EDITOR_REQUEST_OPTIONS,
   });
   const pageQuery = useEditorPage(persistedId ?? '', {
     enabled: postType === 'page' && !!persistedId,
     defaultErrorHandler: false,
+    refetchOnMount: false,
     requestOptions: EDITOR_REQUEST_OPTIONS,
   });
   const saved = postType === 'page' ? pageQuery.data?.pages[0] : postQuery.data?.posts[0];
@@ -395,18 +456,32 @@ export function useEditorSession({
       return 'failed';
     }
 
+    // The writer may leave while the read is out. Whatever it finds no longer
+    // concerns them, and the query belongs to whatever editor opens the post next:
+    // cancelling its opening read would revert it to the copy cached before that read.
+    const left = () => session.getState().kind === 'disposed';
     const { url, queryKey } = editorRead(postType, persistedId);
     let data: EditorReadResponse;
     try {
       data = await fetchApi<EditorReadResponse>(url, EDITOR_REQUEST_OPTIONS);
     } catch (error) {
+      if (left()) {
+        return 'abandoned';
+      }
       return error instanceof APIError && error.response?.status === 404 ? 'gone' : 'failed';
+    }
+    if (left()) {
+      return 'abandoned';
     }
 
     let fresh = recordIn(postType, data);
     if (!fresh) {
       return 'gone';
     }
+
+    // Before adopting: an older refetch must not land after the seed below, and an
+    // edit made while this waits must reach the session's own refusal.
+    await queryClient.cancelQueries({ queryKey, exact: true });
 
     // A normal detail refetch may have completed while this isolated reload was
     // in flight. Never replace a version we already know is newer.
@@ -422,8 +497,6 @@ export function useEditorSession({
     }
     // The loader owns the same query. Seed it with the accepted document so a
     // quick close and reopen cannot resurrect the stale version it first read.
-    // Cancel first so an older refetch cannot land after this write.
-    await queryClient.cancelQueries({ queryKey, exact: true });
     queryClient.setQueryData(queryKey, data);
     setTitle(fresh.title === DEFAULT_TITLE ? '' : fresh.title);
     setInitialLexical(fresh.lexical ?? null);
@@ -502,6 +575,38 @@ export function useEditorSession({
 
   const retrySave = useCallback(() => void session.retrySave(), [session]);
 
+  // Sign-in asked for outside the engine shares the engine's dialog; whichever way
+  // it ends answers every request waiting on it.
+  const reauthWaiters = useRef<Array<(signedIn: boolean) => void>>([]);
+  const [reauthRequested, setReauthRequested] = useState(false);
+  const settleReauthRequests = useCallback((signedIn: boolean) => {
+    const waiters = reauthWaiters.current;
+    reauthWaiters.current = [];
+    setReauthRequested(false);
+    for (const resolve of waiters) {
+      resolve(signedIn);
+    }
+  }, []);
+  const requestReauth = useCallback(
+    () =>
+      new Promise<boolean>((resolve) => {
+        reauthWaiters.current.push(resolve);
+        setReauthRequested(true);
+      }),
+    [],
+  );
+  const reauthSucceeded = useCallback(() => {
+    session.reauthSucceeded();
+    settleReauthRequests(true);
+  }, [session, settleReauthRequests]);
+  const reauthAbandoned = useCallback(() => {
+    session.reauthAbandoned();
+    settleReauthRequests(false);
+  }, [session, settleReauthRequests]);
+  // A request still waiting when the editor goes is answered rather than left hanging.
+  useEffect(() => () => settleReauthRequests(false), [settleReauthRequests]);
+  const reauthOpen = state.kind === 'reauth-pending' || reauthRequested;
+
   const excerpt = settings.custom_excerpt ?? '';
   const bind = useMemo<EditorSessionBinding>(
     () => ({
@@ -543,6 +648,7 @@ export function useEditorSession({
       hasUnsavedContent: session.hasUnsavedContent,
       contentText,
       reload,
+      newerVersionAvailable,
       restoreRevision,
       patchFeatureImage: session.patchFeatureImage,
       featureImageAlt,
@@ -560,10 +666,13 @@ export function useEditorSession({
       getSaveSnapshot: session.getSaveSnapshot,
       getLiveLexical: session.getLiveLexical,
       retrySave,
+      invalidField: session.invalidField,
       saveExplicit: session.dispatchExplicit,
       dispatchPublish,
-      reauthSucceeded: session.reauthSucceeded,
-      reauthAbandoned: session.reauthAbandoned,
+      reauthOpen,
+      requestReauth,
+      reauthSucceeded,
+      reauthAbandoned,
       leaveRequested: session.leaveRequested,
       dispose: session.dispose,
     }),
@@ -582,6 +691,7 @@ export function useEditorSession({
       isDirtyNow,
       isNew,
       loadedRecord,
+      newerVersionAvailable,
       persistedId,
       publishTime,
       reload,
@@ -593,6 +703,10 @@ export function useEditorSession({
       stageSettings,
       state,
       pendingSave,
+      reauthOpen,
+      reauthAbandoned,
+      reauthSucceeded,
+      requestReauth,
     ],
   );
 }

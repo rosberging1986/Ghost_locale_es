@@ -15,6 +15,29 @@ import {
 } from './run-history.test-utils';
 
 describe('Run history preserves editor drafts', () => {
+  it('makes metadata readonly during history and restores the unsaved draft after closing', async () => {
+    setup();
+    respond(history('a'));
+    await renderAdminApp('/automations/first', flags);
+    const nameField = () => page.getByRole('textbox', { name: 'Automation name', exact: true });
+    await nameField().fill('Unsaved name');
+    await open();
+    await select();
+    await expect.element(canvas()).toBeVisible();
+    await expect.element(nameField()).not.toBeInTheDocument();
+    await expect.element(page.getByText('Unsaved name', { exact: true })).toBeVisible();
+    await page.getByRole('tab', { name: 'Settings' }).click();
+    await expect
+      .element(page.getByRole('textbox', { name: 'Description', exact: true }))
+      .toBeDisabled();
+    await close();
+    await expect.element(nameField()).toBeEnabled();
+    await expect.element(nameField()).toHaveValue('Unsaved name');
+    await expect
+      .element(page.getByRole('textbox', { name: 'Description', exact: true }))
+      .toBeEnabled();
+  });
+
   it('contains history render errors and retries without remounting the editor', async () => {
     setup();
     respond({ ...history('a'), status: 'exited_early' });
@@ -78,7 +101,7 @@ describe('Run history preserves editor drafts', () => {
     await input.fill('3');
     await expect.element(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
     // Invalid field text lives in the input, outside the saved editor draft.
-    await input.fill('0');
+    await input.fill('31');
     await open();
     await select();
     await expect.element(canvas()).toHaveTextContent('Alex');
@@ -87,7 +110,7 @@ describe('Run history preserves editor drafts', () => {
       .not.toBeVisible();
     await expect.element(page.getByRole('button', { name: 'Save', exact: true })).toBeDisabled();
     await close();
-    await expect.element(input).toHaveValue('0');
+    await expect.element(input).toHaveValue('31');
     await expect.element(page.getByRole('article', { name: 'Wait: 3 days' })).toBeVisible();
     await expect.element(page.getByRole('button', { name: 'Save', exact: true })).toBeEnabled();
     expect(save.requests).toHaveLength(0);

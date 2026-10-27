@@ -5,7 +5,6 @@ import {
   publishAlreadySent,
   publishBackToSettings,
   publishConfirm,
-  publishCompleteNote,
   publishConfirmError,
   publishContinue,
   publishEmailSizeWarning,
@@ -16,10 +15,12 @@ import {
   publishFlowOptions,
   publishFlowPreview,
   publishLimitsError,
+  publishNewsletterSelect,
   publishRecipientFree,
   publishRecipientSegments,
   publishRecipientSpecific,
   publishRetryEmail,
+  publishRetryError,
   publishRevertToDraft,
   publishScheduleDate,
   publishScheduleTime,
@@ -47,7 +48,6 @@ export const publishScreen = {
   options: () => page.getByTestId(publishFlowOptions),
   confirm: () => page.getByTestId(publishFlowConfirm),
   complete: () => page.getByTestId(publishFlowComplete),
-  completeNote: () => page.getByTestId(publishCompleteNote),
   emailError: () => page.getByTestId(publishEmailErrorStep),
   /** The collapsed row's toggle button. */
   setting: (name: keyof typeof SETTINGS) => page.getByTestId(SETTINGS[name]).getByRole('button'),
@@ -59,6 +59,7 @@ export const publishScreen = {
   scheduleTime: () => page.getByTestId(publishScheduleTime),
   continueButton: () => page.getByTestId(publishContinue),
   previewButton: () => page.getByTestId(publishFlowPreview),
+  newsletterSelect: () => page.getByTestId(publishNewsletterSelect),
   recipientFree: () => page.getByTestId(publishRecipientFree),
   recipientSpecific: () => page.getByTestId(publishRecipientSpecific),
   recipientSearch: () => page.getByTestId(publishRecipientSegments).getByRole('combobox'),
@@ -71,6 +72,11 @@ export const publishScreen = {
   emailSizeWarning: () => page.getByTestId(publishEmailSizeWarning),
   alreadySent: () => page.getByTestId(publishAlreadySent),
   retryEmailButton: () => page.getByTestId(publishRetryEmail),
+  retryError: () => page.getByTestId(publishRetryError),
+  checkRetryAvailability: () =>
+    page
+      .getByTestId(publishEmailErrorStep)
+      .getByRole('button', { name: 'Check retry availability', exact: true }),
   revertToDraft: () => page.getByTestId(publishRevertToDraft),
   tkReminder: () => page.getByTestId(tkReminderDialog),
   publicPreviewWarning: () => page.getByTestId(publicPreviewWarningDialog),

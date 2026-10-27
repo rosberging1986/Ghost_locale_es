@@ -40,6 +40,7 @@ interface RenderOptions {
   isPost?: boolean;
   post?: PublishFlowPost;
   newsletterSlug?: string;
+  fallbackNewsletterSlug?: string;
   previewUrl?: string;
   onBeforeOpen?: () => Promise<void>;
   onOpenChange?: (open: boolean) => void;
@@ -50,6 +51,7 @@ async function renderPreviewModal({
   isPost = true,
   post,
   newsletterSlug,
+  fallbackNewsletterSlug,
   previewUrl = PREVIEW_URL,
   onBeforeOpen,
   onOpenChange = () => {},
@@ -57,6 +59,7 @@ async function renderPreviewModal({
 }: RenderOptions = {}) {
   return await renderInApp(
     <PostPreviewModal
+      fallbackNewsletterSlug={fallbackNewsletterSlug}
       isPost={isPost}
       newsletterSlug={newsletterSlug}
       post={post}
@@ -275,6 +278,7 @@ describe('Post preview modal', () => {
 
   it('closes the preview on an Escape pressed inside a same-origin site frame', async () => {
     fakePreviewWorld();
+    await fakeFrameOrigin(window.location.origin, '<p>Post preview</p>');
     const onOpenChange = vi.fn();
     await renderPreviewModal({
       onOpenChange,
@@ -296,6 +300,7 @@ describe('Post preview modal', () => {
   it('leaves the Web preview cleanly after its frame has followed a link to another site', async () => {
     fakePreviewWorld();
     fakeEmailPreview();
+    await fakeFrameOrigin(window.location.origin, '<p>Post preview</p>');
     await fakeFrameOrigin('http://elsewhere.test', '<p>Another site</p>');
     const onOpenChange = vi.fn();
     await renderPreviewModal({
@@ -692,6 +697,24 @@ describe('Post preview modal', () => {
 
     await expect.element(previewScreen.newsletterSelect()).toHaveTextContent('Monthly roundup');
     await expect.poll(() => previewApi.lastRequest?.url).toContain('newsletter=monthly-roundup');
+  });
+
+  it.each([
+    ['the fallback newsletter for a post without one', undefined, 'Monthly roundup'],
+    ['the post’s own newsletter over the fallback', 'weekly-digest', 'Weekly digest'],
+  ])('preselects %s', async (_case, newsletterSlug, expected) => {
+    fakePreviewWorld({
+      newsletters: [
+        newsletter({ name: 'Weekly digest', slug: 'weekly-digest' }),
+        newsletter({ name: 'Monthly roundup', slug: 'monthly-roundup' }),
+      ],
+    });
+    fakeEmailPreview();
+    await renderPreviewModal({ newsletterSlug, fallbackNewsletterSlug: 'monthly-roundup' });
+
+    await previewScreen.emailTab().click();
+
+    await expect.element(previewScreen.newsletterSelect()).toHaveTextContent(expected);
   });
 
   it('keeps the post’s archived newsletter selected everywhere', async () => {

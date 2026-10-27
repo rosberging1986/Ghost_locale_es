@@ -1,6 +1,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { editorConflictReloadConfirm } from '@tryghost/test-data/selectors/editor';
+import {
+  editorConflictReloadConfirm,
+  editorNewerVersionNotice,
+} from '@tryghost/test-data/selectors/editor';
 import { toast } from 'sonner';
 import type { PendingSave, SaveEngineState, SaveError } from '@/editor/engine/save-engine';
 import { reportShownAlert } from '@/editor/report-error';
@@ -14,10 +17,9 @@ vi.mock('@tryghost/admin-x-framework/api/config', async (importOriginal) => ({
   useBrowseConfig: () => ({ data: undefined }),
 }));
 
-const noop = () => undefined;
-
 interface BannerOverrides {
   pendingSave?: PendingSave;
+  newerVersionAvailable?: boolean;
   hasUnsavedContent?: () => boolean;
   contentText?: () => string;
   onReload?: () => Promise<ReloadOutcome>;
@@ -28,10 +30,10 @@ function renderBanners(state: SaveEngineState, overrides: BannerOverrides = {}) 
     <SessionBanners
       contentText={overrides.contentText ?? (() => '')}
       hasUnsavedContent={overrides.hasUnsavedContent ?? (() => false)}
+      newerVersionAvailable={overrides.newerVersionAvailable}
       pendingSave={overrides.pendingSave}
       state={state}
       onReload={overrides.onReload ?? (() => Promise.resolve('reloaded'))}
-      onRetrySave={noop}
     />,
   );
 }
@@ -90,8 +92,8 @@ describe('SessionBanners', () => {
     expect(container).toBeEmptyDOMElement();
   });
 
-  it('explains held validation without presenting a failed network save', () => {
-    renderBanners(
+  it('leaves held validation to the field that breaks its rule', () => {
+    const { container } = renderBanners(
       { kind: 'idle' },
       {
         pendingSave: {
@@ -99,11 +101,8 @@ describe('SessionBanners', () => {
         },
       },
     );
-    expect(screen.getByRole('status')).toHaveTextContent(
-      'Changes are waiting to save. At least one author is required.',
-    );
-    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
-    expect(screen.queryByRole('button', { name: 'Retry' })).not.toBeInTheDocument();
+
+    expect(container).toBeEmptyDOMElement();
   });
 
   it('shows nothing while the sign-in dialog holds the queue', () => {
@@ -116,13 +115,13 @@ describe('SessionBanners', () => {
     renderBanners(CONFLICT);
 
     expect(screen.getByRole('alert')).toHaveTextContent('Someone else is editing this post');
-    expect(screen.getByRole('alert')).toHaveClass('bg-destructive', 'text-destructive-foreground');
+    expect(screen.getByRole('alert')).toHaveClass('bg-state-danger/10');
+    expect(screen.getByRole('alert')).not.toHaveClass('bg-destructive');
     expect(screen.getByRole('alert').firstElementChild).toHaveClass('justify-center', 'flex-wrap');
-    expect(screen.getByText(/Someone else is editing this post/)).toHaveClass(
-      'text-center',
-      'text-inherit',
-    );
-    expect(screen.getByRole('button', { name: 'Reload' })).toBeVisible();
+    expect(
+      screen.getByText(/Someone else is editing this post/).closest('.text-center'),
+    ).not.toBeNull();
+    expect(screen.getByRole('button', { name: 'Reload' })).toHaveClass('bg-destructive');
     expect(screen.getByRole('button', { name: 'Copy content' })).toBeVisible();
   });
 
@@ -234,56 +233,65 @@ describe('SessionBanners', () => {
     await waitFor(() => expect(error).toHaveBeenCalledWith('Couldn’t copy your content'));
   });
 
-  it('explains an unreachable server rather than repeating the transport error', () => {
-    renderBanners(errored({ kind: 'transport', message: 'Failed to fetch' }));
+  it('says a newer version was saved elsewhere and reloads onto it', () => {
+    const onReload = vi.fn((): Promise<ReloadOutcome> => Promise.resolve('reloaded'));
+    renderBanners({ kind: 'idle' }, { newerVersionAvailable: true, onReload });
 
-    expect(screen.getByRole('alert')).toHaveTextContent('Couldn’t reach the server');
-    expect(screen.getByRole('alert')).not.toHaveTextContent('Failed to fetch');
+    expect(screen.getByTestId(editorNewerVersionNotice)).toHaveTextContent(
+      'This post was updated elsewhere.',
+    );
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+
+    expect(onReload).toHaveBeenCalledTimes(1);
+    expect(screen.queryByTestId(editorConflictReloadConfirm)).not.toBeInTheDocument();
   });
 
-  it('repeats a session failure the writer already dismissed', () => {
-    renderBanners(errored({ kind: 'session-invalid', message: 'Unauthorized' }));
+  it('says so when the newer version could not be read, and keeps offering it', async () => {
+    const error = vi.spyOn(toast, 'error').mockReturnValue('');
+    renderBanners(
+      { kind: 'idle' },
+      { newerVersionAvailable: true, onReload: () => Promise.resolve('failed') },
+    );
 
-    expect(screen.getByRole('alert')).toHaveTextContent('Your session expired');
+    fireEvent.click(screen.getByRole('button', { name: 'Reload' }));
+
+    await waitFor(() => expect(error).toHaveBeenCalledWith('Couldn’t reload this post'));
+    expect(screen.getByTestId(editorNewerVersionNotice)).toBeVisible();
+    expect(screen.getByRole('button', { name: 'Reload' })).toBeEnabled();
   });
 
-  it.each<[SaveError['kind']]>([['validation'], ['host-limit'], ['unknown']])(
-    'shows what the server said about a %s failure',
-    (kind) => {
-      renderBanners(errored({ kind, message: 'Title cannot be longer than 255 characters.' }));
+  it('gives way to a collision', () => {
+    renderBanners(CONFLICT, { newerVersionAvailable: true });
 
-      expect(screen.getByRole('alert')).toHaveTextContent(
-        'Title cannot be longer than 255 characters.',
-      );
-      expect(screen.getByRole('button', { name: 'Retry' })).toBeVisible();
-    },
-  );
+    expect(screen.getByRole('alert')).toHaveTextContent('Someone else is editing this post');
+    expect(screen.queryByTestId(editorNewerVersionNotice)).not.toBeInTheDocument();
+  });
+
+  it('leaves a failed save to the status line', () => {
+    const { container } = renderBanners(errored({ kind: 'transport', message: 'Failed to fetch' }));
+
+    expect(container).toBeEmptyDOMElement();
+  });
+
+  it('leaves held validation to the status line while it reports the refused save', () => {
+    const { container } = renderBanners(
+      errored({ kind: 'validation', message: 'At least one author is required.' }),
+      {
+        pendingSave: {
+          blockedBy: { kind: 'validation', message: 'At least one author is required.' },
+        },
+      },
+    );
+
+    expect(container).toBeEmptyDOMElement();
+  });
 });
 
 describe('SessionBanners reporting', () => {
   beforeEach(() => {
     vi.mocked(reportShownAlert).mockClear();
-  });
-
-  it('reports a failed-save banner once, by the text shown, not per render', () => {
-    const error: SaveError = { kind: 'transport', message: 'Offline' };
-    const state = errored(error);
-    const { rerender } = renderBanners(state);
-    rerender(
-      <SessionBanners
-        contentText={() => ''}
-        hasUnsavedContent={() => false}
-        state={state}
-        onReload={() => Promise.resolve('reloaded')}
-        onRetrySave={noop}
-      />,
-    );
-
-    expect(reportShownAlert).toHaveBeenCalledTimes(1);
-    expect(reportShownAlert).toHaveBeenCalledWith(
-      'Couldn’t reach the server. Your changes are still here.',
-      error,
-    );
   });
 
   it('reports a collision held on a pending save once across re-renders', () => {
@@ -297,7 +305,6 @@ describe('SessionBanners reporting', () => {
         pendingSave={{ blockedBy }}
         state={{ kind: 'idle' }}
         onReload={() => Promise.resolve('reloaded')}
-        onRetrySave={noop}
       />,
     );
 
@@ -359,6 +366,7 @@ describe('SessionBanners reporting', () => {
     ['idle', { kind: 'idle' }, undefined],
     ['saving', { kind: 'saving', intent: 'autosave' }, undefined],
     ['an expired session', { kind: 'reauth-pending', intent: 'explicit' }, undefined],
+    ['a failed save, which the status line reports', errored({ kind: 'transport' }), undefined],
     [
       'a held validation',
       { kind: 'idle' },

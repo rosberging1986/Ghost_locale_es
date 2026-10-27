@@ -12,7 +12,7 @@ import {
 } from '../utils/api/hooks';
 import type { ReadonlyDeep } from 'type-fest';
 
-export type AutomationStatus = 'active' | 'inactive';
+export type AutomationStatus = 'active' | 'inactive' | 'archived';
 export const MAX_AUTOMATION_ACTIONS = 50;
 
 export type Automation = {
@@ -68,19 +68,34 @@ export type AutomationEdge = {
   target_action_id: string;
 };
 
-export type AutomationDetail = Automation & {
-  created_at: string;
-  updated_at: string;
-  actions: AutomationAction[];
-  edges: AutomationEdge[];
-};
+export type AutomationTrigger =
+  | {
+      trigger_tier_scope: 'free' | 'all_paid' | null;
+      trigger_tier_ids: null;
+    }
+  | {
+      trigger_tier_scope: 'selected_paid';
+      trigger_tier_ids: readonly string[];
+    };
 
-export type EditAutomationPayload = {
+export type AutomationDetail = Automation &
+  AutomationTrigger & {
+    created_at: string;
+    updated_at: string;
+    actions: AutomationAction[];
+    edges: AutomationEdge[];
+  };
+
+export type EditAutomationPayload = AutomationTrigger & {
   id: string;
+  name: string;
+  description: string;
   status: AutomationStatus;
   actions: AutomationAction[];
   edges: AutomationEdge[];
 };
+
+type AutomationStatusPayload = Pick<EditAutomationPayload, 'id' | 'status'>;
 
 export interface AutomationsResponseType {
   meta?: Meta;
@@ -307,24 +322,56 @@ const serializeEditableAction = (action: AutomationAction): AutomationAction => 
   }
 };
 
+const serializeEditableAutomation = ({
+  name,
+  description,
+  trigger_tier_scope: triggerTierScope,
+  trigger_tier_ids: triggerTierIds,
+  status,
+  actions,
+  edges,
+}: Partial<Omit<EditAutomationPayload, 'id'>> & Pick<EditAutomationPayload, 'status'>) => ({
+  automations: [
+    {
+      name,
+      description,
+      trigger_tier_scope: triggerTierScope,
+      trigger_tier_ids: triggerTierIds,
+      status,
+      actions: actions?.map(serializeEditableAction),
+      edges,
+    },
+  ],
+});
+
+export const useAddAutomation = createMutation<
+  AutomationDetailResponseType,
+  Omit<EditAutomationPayload, 'id'>
+>({
+  method: 'POST',
+  path: () => '/automations/',
+  body: serializeEditableAutomation,
+  invalidateQueries: { dataType },
+});
+
 export const useEditAutomation = createMutation<
   AutomationDetailResponseType,
   EditAutomationPayload
 >({
   method: 'PUT',
   path: ({ id }) => `/automations/${id}/`,
-  body: ({ status, actions, edges }) => ({
-    automations: [
-      {
-        status,
-        actions: actions.map(serializeEditableAction),
-        edges,
-      },
-    ],
-  }),
-  invalidateQueries: {
-    dataType,
-  },
+  body: serializeEditableAutomation,
+  invalidateQueries: { dataType },
+});
+
+export const useSetAutomationStatus = createMutation<
+  AutomationDetailResponseType,
+  AutomationStatusPayload
+>({
+  method: 'PUT',
+  path: ({ id }) => `/automations/${id}/`,
+  body: serializeEditableAutomation,
+  invalidateQueries: { dataType },
 });
 
 export const usePreviewAutomationEmail = createMutation<
